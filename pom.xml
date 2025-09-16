@@ -29,6 +29,13 @@
             <version>2.20.0</version>
         </dependency>
 
+        <dependency>
+            <groupId>com.amazonaws</groupId>
+            <artifactId>aws-java-sdk-secretsmanager</artifactId>
+            <version>1.12.767</version> <!-- keep consistent with your other AWS SDK version -->
+        </dependency>
+
+
         <!-- AWS SDK v2: S3 -->
         <dependency>
             <groupId>software.amazon.awssdk</groupId>
@@ -56,6 +63,13 @@
             <artifactId>slf4j-api</artifactId>
             <version>2.0.7</version>
         </dependency>
+
+        <dependency>
+            <groupId>com.amazonaws</groupId>
+            <artifactId>aws-java-sdk-ssm</artifactId>
+            <version>1.12.767</version> <!-- keep consistent with your other AWS SDK versions -->
+        </dependency>
+
 
         <dependency>
             <groupId>org.slf4j</groupId>
