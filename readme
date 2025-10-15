@@ -1,1 +1,166 @@
-This helps us to understand the code 
+package com.nextera.fim.utils;
+
+import com.jcraft.jsch.*;
+import com.nextera.fim.app.config.Environment;
+import com.nextera.fim.app.model.KomgoDTO;
+import lombok.Builder;
+import lombok.Getter;
+import lombok.NoArgsConstructor;
+import lombok.Setter;
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
+
+import java.io.ByteArrayInputStream;
+import java.io.ByteArrayOutputStream;
+import java.nio.charset.StandardCharsets;
+import java.util.*;
+
+import static com.nextera.fim.utils.S3IFileSystemFacade.s3FileKey;
+
+public class KomgoConnectionImpl implements KomgoConnection {
+    private static final Logger logger = LoggerFactory.getLogger(KomgoConnectionImpl.class);
+
+    private static final int RETRY_ATTEMPTS = Optional.of(Environment.KOMGO_SFTP_RETRY_ATTEMPTS.getValueAsInt())
+            .orElseThrow(() -> new RuntimeException("KOMGO_SFTP_RETRY_ATTEMPTS is not set in the environment"));
+
+    private static final int RETRY_WAIT = Optional.of(Environment.KOMGO_SFTP_RETRY_WAIT.getValueAsInt())
+            .orElseThrow(() -> new RuntimeException("KOMGO_SFTP_RETRY_WAIT is not set in the environment"));
+
+    KomgoCredentials credentials;
+    IFileSystemFacade fileSystemFacade;
+    ProxyHTTP proxy = new ProxyHTTP("evapzen.FPL.com", 10262);
+    Session jschSession;
+
+    public KomgoConnectionImpl(KomgoCredentials credentials,
+                               IFileSystemFacade fileSystemFacade) {
+        this.credentials = credentials;
+        this.fileSystemFacade = fileSystemFacade;
+    }
+
+    private void setupJsch() throws JSchException {
+        JSch jsch = new JSch();
+        jsch.addIdentity(credentials.privateKeyPath);
+
+        jschSession = jsch.getSession(credentials.username, credentials.remoteHost);
+
+        Properties config = new Properties();
+        config.put("StrictHostKeyChecking", "no");
+        config.put("PreferredAuthentications", "publickey");
+        jschSession.setConfig(config);
+
+        jschSession.setProxy(proxy);
+
+        jschSession.connect();
+    }
+
+    @Override
+    public void putRequest(String content, String fileName) throws JSchException {
+        setupJsch();
+        try (ByteArrayInputStream sftpInputStream = new ByteArrayInputStream(content.getBytes());
+             ByteArrayInputStream s3InputStream = new ByteArrayInputStream(content.getBytes())) {
+
+            fileSystemFacade.save(s3FileKey(fileName), s3InputStream);
+
+            ChannelSftp channelSftp = (ChannelSftp) jschSession.openChannel("sftp");
+            channelSftp.connect();
+            channelSftp.put(sftpInputStream, Environment.KOMGO_SFTP_WRITE_PATH.getValueAsString() + "/" + fileName);
+            channelSftp.disconnect();
+        } catch (Exception e) {
+            logger.error("Error while writing file in Komgo SFTP {}", e.getMessage());
+            throw new RuntimeException(e);
+        } finally {
+            jschSession.disconnect();
+        }
+    }
+
+    @Override
+    public List<KomgoDTO> getResponse() throws JSchException {
+        logger.info("Fetching From Komgo SFTP");
+
+        setupJsch();
+
+        ChannelSftp channelSftp = (ChannelSftp) jschSession.openChannel("sftp");
+
+        channelSftp.connect();
+
+        int attemptNumber = 0;
+        try {
+            while (++attemptNumber <= RETRY_ATTEMPTS) {
+                try {
+
+                    return fetchResponseFile(channelSftp);
+
+                } catch (Exception ex) { //response file does not exist
+                    logger.info("Attempt " + attemptNumber + " of " + RETRY_ATTEMPTS + " failed. Response file was not found at expected location. " + ex.getMessage());
+
+                    if (attemptNumber < RETRY_ATTEMPTS) {
+                        waitBeforeRetry();
+                    }
+                }
+            }
+        } catch (Exception e) {
+            e.printStackTrace();
+        } finally {
+            channelSftp.disconnect();
+            --attemptNumber;
+        }
+
+        logger.warn("Failed to fetch Komgo sftp file after {} attempts", attemptNumber);
+        throw new RuntimeException("Failed to fetch Komgo sftp file after " + attemptNumber + " attempts");
+    }
+
+    private void waitBeforeRetry() {
+        try {
+            long sleepTimeMillis = RETRY_WAIT * 1000L;
+            logger.info("sleeping for {} seconds", RETRY_WAIT);
+            Thread.sleep(sleepTimeMillis);
+        } catch (InterruptedException e) {
+            throw new RuntimeException("A problem occurred while sleeping!", e);
+        }
+    }
+
+    private List<KomgoDTO> fetchResponseFile(ChannelSftp channelSftp) throws SftpException {
+
+        logger.info("Fetch response file from komgo SFTP");
+        List<KomgoDTO> responseFiles = new ArrayList<>();
+
+        // SFTP Path
+        String[] komgoFilePath = Environment.KOMGO_SFTP_READ_PATH.getValueAsString().split(",");
+        for (String filePath : komgoFilePath) {
+
+            String contentType = filePath.contains("Data") ? "data" : "doc";
+
+            Vector<ChannelSftp.LsEntry> ls = channelSftp.ls(filePath);
+            for (ChannelSftp.LsEntry entry : ls) {
+                ByteArrayOutputStream outputStream = new ByteArrayOutputStream();
+                channelSftp.get(filePath + "/" +entry.getFilename(), outputStream);
+
+                byte[] bytes = outputStream.toByteArray();
+
+                KomgoDTO komgoDTO = new KomgoDTO(new String(bytes, StandardCharsets.UTF_8), entry.getFilename(), contentType);
+                responseFiles.add(komgoDTO);
+
+                // Publish file to s3
+                fileSystemFacade.save(komgoDTO.getS3Key(), new ByteArrayInputStream(bytes));
+            }
+        }
+        return responseFiles;
+    }
+
+    @NoArgsConstructor
+    @Getter
+    @Setter
+    public static class KomgoCredentials {
+        private String remoteHost;
+        private String username;
+        private String privateKeyPath;
+
+        @Builder
+        public KomgoCredentials(String remoteHost, String username, String privateKeyPath) {
+            this.remoteHost = remoteHost;
+            this.username = username;
+            this.privateKeyPath = privateKeyPath;
+        }
+    }
+
+}
